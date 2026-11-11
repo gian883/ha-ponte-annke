@@ -32,7 +32,7 @@ const STREAM_NAME = (pos[1] || 'sub').toLowerCase();
 const STREAM_ID = STREAM_NAME === 'main' ? 0 : 1;               // 0 principale, 1 secondario
 
 // ---------- configurazione ----------
-const cfg = { host: '192.168.1.6', port: 10000, user: 'admin', password: '' };
+const cfg = { host: '192.168.1.2', port: 10000, user: 'admin', password: '' };
 try {
   const raw = fs.readFileSync(path.join(DIR, 'config.json'), 'utf8').replace(/^﻿/, '');
   Object.assign(cfg, JSON.parse(raw));
@@ -86,6 +86,11 @@ async function loadLib() {
 }
 
 // ---------- programma ----------
+const MAX_FAILS = 3;          // tentativi consecutivi senza video prima di arrendersi
+const STALL_MS = 5000;        // fermo subito dopo il primo fotogramma chiave
+const NO_VIDEO_MS = 15000;    // nessun video durante la visione
+const GOOD_FRAMES = 10;       // da qui in poi la sessione e considerata sana
+
 (async () => {
   let A;
   try {
@@ -95,86 +100,125 @@ async function loadLib() {
     process.exit(1);
   }
 
-  const c = A.create(0);
-  c.preview = {};
-  let connected = false;
-  let gotKey = false;
-  let frames = 0;
-  let bytes = 0;
-  let lastFrame = Date.now();
-  const t0 = Date.now();
+  let cur = null;       // sessione attiva
+  let stopping = false;
+  let fails = 0;        // sessioni fallite di fila
 
-  const shutdown = (code) => {
-    try { A.close_stream(c, CH - 1, STREAM_ID); } catch (_) {}
-    try { A.close_socket(c); } catch (_) {}
+  const closeSession = (s) => {
+    if (!s || s.closed) return;
+    s.closed = true;
+    try { A.close_stream(s.c, CH - 1, STREAM_ID); } catch (_) {}
+    try { A.close_socket(s.c); } catch (_) {}
+  };
+
+  const finish = (code) => {
+    stopping = true;
+    closeSession(cur);
     setTimeout(() => process.exit(code), 200);
   };
-  process.on('SIGINT', () => shutdown(0));
-  process.on('SIGTERM', () => shutdown(0));
-  process.stdout.on('error', () => shutdown(0)); // go2rtc ha chiuso il flusso
+  process.on('SIGINT', () => finish(0));
+  process.on('SIGTERM', () => finish(0));
+  process.stdout.on('error', () => finish(0)); // go2rtc ha chiuso il flusso
+
+  // Chiude la sessione; se retry=true e restano tentativi, ne apre una nuova
+  // senza uscire (go2rtc continua a ricevere il video da questo stesso processo).
+  const end = (s, reason, code, retry) => {
+    if (!s || s.closed || stopping) return;
+    const secs = ((Date.now() - s.t0) / 1000).toFixed(1);
+    closeSession(s);
+    if (s.frames >= GOOD_FRAMES) fails = 0; else fails++;
+    const detail = `${reason} (sessione di ${secs} s, ${s.frames} fotogrammi)`;
+    if (retry && !TEST && fails < MAX_FAILS) {
+      log(`${detail} - nuovo tentativo ${fails + 1}/${MAX_FAILS} tra 1,5 s`);
+      setTimeout(() => { if (!stopping) startSession(); }, 1500);
+    } else {
+      log(detail + ' - chiudo');
+      finish(code);
+    }
+  };
 
   A.onconnect = (conn, code) => {
-    if (conn !== c) return;
-    if (code !== 0) { log('connessione non riuscita, codice', code); return shutdown(2); }
-    connected = true;
+    const s = cur;
+    if (!s || conn !== s.c || s.closed) return;
+    if (code !== 0) return end(s, 'connessione non riuscita, codice ' + code, 2, true);
+    s.connected = true;
     log(`connesso a ${cfg.host}:${cfg.port}`);
-    A.login(c, String(cfg.user), String(cfg.password));
+    A.login(s.c, String(cfg.user), String(cfg.password));
   };
   A.onloginresult = (conn, r) => {
-    if (conn !== c) return;
+    const s = cur;
+    if (!s || conn !== s.c || s.closed) return;
     if (r !== 0) {
       log(`accesso rifiutato (codice ${r}): controlla utente e password in config.json`);
-      return shutdown(3);
+      return finish(3); // inutile riprovare
     }
     log(`accesso OK, apro canale ${CH} (${STREAM_NAME === 'main' ? 'principale' : 'secondario'})`);
-    A.open_stream(c, CH - 1, STREAM_ID);
+    A.open_stream(s.c, CH - 1, STREAM_ID);
   };
-  A.onopenstream = (conn, ch, s, r) => {
-    if (conn !== c) return;
-    if (r !== 0) { log('apertura canale non riuscita, codice', r); shutdown(4); }
+  A.onopenstream = (conn, ch, st, r) => {
+    const s = cur;
+    if (!s || conn !== s.c || s.closed) return;
+    if (r !== 0) end(s, 'apertura canale non riuscita, codice ' + r, 4, true);
   };
   A.ondisconnect = (conn, code) => {
-    if (conn !== c) return;
-    log('disconnesso dall\'NVR, codice', code);
-    shutdown(5);
+    const s = cur;
+    if (!s || conn !== s.c || s.closed) return;
+    end(s, "disconnesso dall'NVR, codice " + code, 5, true);
   };
   A.onclosestream = () => {};
   A.onptzresult = () => {};
 
   A.onrecvframeex = (conn, frametype, data, len, ch, w, h, enc) => {
-    if (conn !== c) return;
+    const s = cur;
+    if (!s || conn !== s.c || s.closed) return;
     if (frametype !== 1 && frametype !== 2) return;      // 1 = chiave, 2 = intermedio; 0 = audio
-    if (!gotKey) {
+    if (!s.gotKey) {
       if (frametype !== 1) return;                       // si parte sempre da un fotogramma chiave
-      gotKey = true;
-      log(`primo fotogramma chiave: ${enc} ${w}x${h}`);
+      s.gotKey = true;
+      log(`primo fotogramma chiave: ${enc} ${w}x${h} (dopo ${((Date.now() - s.t0) / 1000).toFixed(1)} s)`);
     }
-    frames++;
-    bytes += len;
-    lastFrame = Date.now();
+    s.frames++;
+    s.bytes += len;
+    s.lastFrame = Date.now();
+    if (s.frames === GOOD_FRAMES) fails = 0;
     if (!TEST) process.stdout.write(Buffer.from(data.subarray(0, len)));
   };
 
+  function startSession() {
+    const s = { c: A.create(0), connected: false, gotKey: false, frames: 0, bytes: 0, closed: false, t0: Date.now(), lastFrame: Date.now() };
+    s.c.preview = {};
+    cur = s;
+    log(`collegamento a ${cfg.host}:${cfg.port}...`);
+    A.connectbyip(s.c, cfg.host, String(cfg.port));
+  }
+
   // controlli di sicurezza
   setInterval(() => {
+    const s = cur;
+    if (!s || s.closed || stopping) return;
     const now = Date.now();
-    if (!connected && now - t0 > 10000) { log('nessuna risposta dall\'NVR in 10 s'); shutdown(6); }
-    if (gotKey && now - lastFrame > 15000) { log('nessun video da 15 s, chiudo'); shutdown(7); }
-  }, 2000);
+    if (!s.connected && now - s.t0 > 10000) return end(s, "nessuna risposta dall'NVR in 10 s", 6, true);
+    if (s.connected && !s.gotKey && now - s.t0 > 15000) return end(s, 'nessun fotogramma chiave entro 15 s', 10, true);
+    if (s.gotKey && s.frames < GOOD_FRAMES && now - s.lastFrame > STALL_MS) {
+      return end(s, `flusso fermo da ${STALL_MS / 1000} s subito dopo il primo fotogramma`, 9, true);
+    }
+    if (s.gotKey && now - s.lastFrame > NO_VIDEO_MS) return end(s, `nessun video da ${NO_VIDEO_MS / 1000} s`, 7, true);
+  }, 1000);
 
   if (TEST) {
+    const t0 = Date.now();
     setTimeout(() => {
-      const s = (Date.now() - t0) / 1000;
-      if (frames > 0) {
-        log(`PROVA RIUSCITA: ${frames} fotogrammi, ${(bytes / 1024).toFixed(0)} KB in ${s.toFixed(1)} s`);
-        shutdown(0);
+      const s = cur;
+      const secs = (Date.now() - t0) / 1000;
+      if (s && s.frames > 0) {
+        log(`PROVA RIUSCITA: ${s.frames} fotogrammi, ${(s.bytes / 1024).toFixed(0)} KB in ${secs.toFixed(1)} s`);
+        finish(0);
       } else {
         log('PROVA FALLITA: nessun fotogramma video ricevuto');
-        shutdown(8);
+        finish(8);
       }
     }, 10000);
   }
 
-  log(`collegamento a ${cfg.host}:${cfg.port}...`);
-  A.connectbyip(c, cfg.host, String(cfg.port));
+  startSession();
 })();
