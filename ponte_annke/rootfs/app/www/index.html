@@ -1,0 +1,147 @@
+<!doctype html>
+<html lang="it">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Telecamere</title>
+<style>
+  :root { color-scheme: dark; }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: #111; color: #eee; font: 15px system-ui, sans-serif; }
+  header { display: flex; align-items: center; gap: 12px; padding: 10px 14px; background: #1b1b1b; }
+  header h1 { font-size: 17px; margin: 0; flex: 1; }
+  #grid { display: grid; gap: 8px; padding: 8px; grid-template-columns: repeat(auto-fit, minmax(320px, 1fr)); }
+  .tile { position: relative; background: #000; border-radius: 8px; overflow: hidden; cursor: pointer; aspect-ratio: 16/9; }
+  .tile video-stream, .tile video { width: 100%; height: 100%; display: block; object-fit: contain; }
+  .tile .name { position: absolute; left: 8px; bottom: 6px; background: #0009; padding: 2px 8px; border-radius: 6px; pointer-events: none; }
+  #full { position: fixed; inset: 0; background: #000; display: none; flex-direction: column; z-index: 10; }
+  #full.on { display: flex; }
+  #bar { display: flex; align-items: center; gap: 8px; padding: 8px 10px; background: #1b1b1bee; }
+  #bar .title { flex: 1; text-align: center; font-weight: 600; }
+  button { background: #333; color: #fff; border: 0; border-radius: 8px; padding: 10px 14px; font-size: 16px; cursor: pointer; min-width: 48px; }
+  button:hover { background: #444; }
+  button.on { background: #2e7d32; }
+  #stage { flex: 1; min-height: 0; }
+  #stage video-stream, #stage video { width: 100%; height: 100%; display: block; object-fit: contain; }
+  .hint { padding: 6px 12px; font-size: 12px; color: #aaa; text-align: center; }
+</style>
+</head>
+<body>
+<header><h1>Telecamere Annke</h1><span id="count"></span></header>
+<div id="grid"></div>
+<div class="hint">Tocca una telecamera per aprirla in HD con audio.</div>
+
+<div id="full">
+  <div id="bar">
+    <button id="prev" title="Precedente">&#9664;</button>
+    <span class="title" id="ftitle"></span>
+    <button id="next" title="Successiva">&#9654;</button>
+    <button id="snd" title="Audio">&#128263; Audio</button>
+    <button id="close" title="Chiudi">&#10005; Chiudi</button>
+  </div>
+  <div id="stage"></div>
+</div>
+
+<script type="module">
+import './video-stream.js';
+
+const grid = document.getElementById('grid');
+const full = document.getElementById('full');
+const stage = document.getElementById('stage');
+const ftitle = document.getElementById('ftitle');
+const snd = document.getElementById('snd');
+const MODE = 'webrtc,mse,hls,mjpeg';
+let cams = [];
+let idx = -1;
+let soundOn = false;
+
+function player(src, muted) {
+  const el = document.createElement('video-stream');
+  el.mode = MODE;
+  el.background = false;
+  el.src = new URL('api/ws?src=' + encodeURIComponent(src), location.href);
+  el.addEventListener('streamready', () => {});
+  if (el.video) el.video.muted = muted;
+  return el;
+}
+
+function buildGrid() {
+  grid.textContent = '';
+  cams.forEach((name, i) => {
+    const t = document.createElement('div');
+    t.className = 'tile';
+    t.dataset.i = i;
+    const p = player(name, true);
+    p.dataset.src = name;
+    t.append(p);
+    const n = document.createElement('div');
+    n.className = 'name';
+    n.textContent = 'Camera ' + (i + 1);
+    t.append(n);
+    t.addEventListener('click', () => openFull(i));
+    grid.append(t);
+  });
+  document.getElementById('count').textContent = cams.length + ' camere';
+}
+
+function stopGrid() { grid.textContent = ''; }
+
+function setSound(on) {
+  soundOn = on;
+  const v = stage.querySelector('video');
+  if (v) v.muted = !on;
+  snd.classList.toggle('on', on);
+  snd.innerHTML = on ? '&#128266; Audio' : '&#128263; Audio';
+}
+
+function showFull() {
+  stage.textContent = '';
+  const name = cams[idx];
+  ftitle.textContent = 'Camera ' + (idx + 1) + ' HD';
+  const p = player(name + '_hd', !soundOn);
+  stage.append(p);
+  // il video interno viene creato in modo asincrono: applica lo stato audio appena pronto
+  const t = setInterval(() => {
+    const v = p.querySelector('video');
+    if (v) { v.muted = !soundOn; v.controls = false; if (soundOn) v.play().catch(() => {}); clearInterval(t); }
+  }, 200);
+  setTimeout(() => clearInterval(t), 10000);
+}
+
+function openFull(i) {
+  idx = i;
+  stopGrid();            // una sola connessione alla volta verso l'NVR
+  full.classList.add('on');
+  showFull();
+}
+
+function closeFull() {
+  stage.textContent = '';
+  full.classList.remove('on');
+  idx = -1;
+  buildGrid();
+}
+
+function step(d) {
+  idx = (idx + d + cams.length) % cams.length;
+  showFull();
+}
+
+document.getElementById('close').onclick = closeFull;
+document.getElementById('prev').onclick = () => step(-1);
+document.getElementById('next').onclick = () => step(1);
+snd.onclick = () => setSound(!soundOn);
+addEventListener('keydown', (e) => {
+  if (!full.classList.contains('on')) return;
+  if (e.key === 'Escape') closeFull();
+  if (e.key === 'ArrowLeft') step(-1);
+  if (e.key === 'ArrowRight') step(1);
+});
+
+const r = await fetch('api/streams');
+const all = await r.json();
+cams = Object.keys(all).filter((k) => /^cam\d+$/.test(k)).sort((a, b) => parseInt(a.slice(3)) - parseInt(b.slice(3)));
+buildGrid();
+</script>
+</body>
+</html>

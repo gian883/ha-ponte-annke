@@ -1,5 +1,5 @@
 name: Ponte Annke
-version: "1.0.2"
+version: 1.0.3
 slug: ponte_annke
 description: Telecamere dell'NVR wireless Annke (Annke Sight / JuanVision) in RTSP per Home Assistant, tramite go2rtc
 url: https://github.com/gian883/ha-ponte-annke
@@ -13,16 +13,18 @@ host_network: true
 ingress: true
 ingress_port: 1994
 panel_icon: mdi:cctv
-panel_title: Telecamere Annke
+panel_title: Annke
 options:
   host: 192.168.1.2
   port: 10000
   user: admin
   password: ""
   channels: 3
+  audio: true
 schema:
   host: str
   port: port
   user: str
   password: password
   channels: int(1,8)
+  audio: bool?

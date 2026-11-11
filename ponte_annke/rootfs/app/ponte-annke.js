@@ -31,6 +31,50 @@ const CH = Math.max(1, parseInt(pos[0] || '1', 10) || 1);       // 1 = primo can
 const STREAM_NAME = (pos[1] || 'sub').toLowerCase();
 const STREAM_ID = STREAM_NAME === 'main' ? 0 : 1;               // 0 principale, 1 secondario
 
+
+// ---------- audio: modalita --audio ----------
+// Il video esce su stdout dal processo principale; l'audio G.711 A-law (8 kHz, mono)
+// dell'NVR viene passato a questo secondo processo tramite un socket locale e
+// pubblicato come WAV. Senza dati (o senza processo principale) emette silenzio,
+// cosi il flusso audio resta sempre vivo per go2rtc.
+const AUDIO_ONLY = args.includes('--audio');
+const SOCK = `/tmp/annke-${CH}-${STREAM_NAME}.sock`;
+const CHUNK = 320;            // 40 ms a 8 kHz, 1 byte per campione
+const SILENCE = 0xd5;         // silenzio in A-law
+
+if (AUDIO_ONLY) {
+  const net = require('net');
+  const header = Buffer.from([
+    0x52, 0x49, 0x46, 0x46, 0xff, 0xff, 0xff, 0xff, 0x57, 0x41, 0x56, 0x45, 0x66, 0x6d, 0x74, 0x20,
+    0x12, 0, 0, 0, 6, 0, 1, 0, 0x40, 0x1f, 0, 0, 0x40, 0x1f, 0, 0, 1, 0, 8, 0, 0, 0,
+    0x64, 0x61, 0x74, 0x61, 0xff, 0xff, 0xff, 0xff,
+  ]);
+  process.stdout.write(header);
+  process.stdout.on('error', () => process.exit(0));
+  let queue = Buffer.alloc(0);
+  let sock = null;
+  const connect = () => {
+    const c = net.createConnection(SOCK);
+    c.on('connect', () => { sock = c; });
+    c.on('data', (d) => {
+      queue = Buffer.concat([queue, d]);
+      if (queue.length > CHUNK * 12) queue = queue.subarray(queue.length - CHUNK * 6); // limita il ritardo
+    });
+    const lost = () => { if (sock === c) sock = null; setTimeout(connect, 1000); };
+    c.on('error', () => {});
+    c.on('close', lost);
+  };
+  connect();
+  setInterval(() => {
+    let out;
+    if (queue.length >= CHUNK) { out = queue.subarray(0, CHUNK); queue = queue.subarray(CHUNK); }
+    else out = Buffer.alloc(CHUNK, SILENCE);
+    process.stdout.write(out);
+  }, 40);
+  process.on('SIGTERM', () => process.exit(0));
+  process.on('SIGINT', () => process.exit(0));
+} else {
+
 // ---------- configurazione ----------
 const cfg = { host: '192.168.1.2', port: 10000, user: 'admin', password: '' };
 try {
@@ -104,6 +148,21 @@ const GOOD_FRAMES = 10;       // da qui in poi la sessione e considerata sana
   let stopping = false;
   let fails = 0;        // sessioni fallite di fila
 
+  // server locale per l'audio (letto dal processo --audio)
+  const audioClients = new Set();
+  if (!TEST && process.env.PONTE_AUDIO !== '0') {
+    const net = require('net');
+    try { fs.unlinkSync(SOCK); } catch (_) {}
+    const srv = net.createServer((c) => {
+      audioClients.add(c);
+      c.on('error', () => {});
+      c.on('close', () => audioClients.delete(c));
+    });
+    srv.on('error', (e) => log('audio: socket non disponibile (' + e.message + ')'));
+    srv.listen(SOCK);
+    process.on('exit', () => { try { fs.unlinkSync(SOCK); } catch (_) {} });
+  }
+
   const closeSession = (s) => {
     if (!s || s.closed) return;
     s.closed = true;
@@ -171,7 +230,14 @@ const GOOD_FRAMES = 10;       // da qui in poi la sessione e considerata sana
   A.onrecvframeex = (conn, frametype, data, len, ch, w, h, enc) => {
     const s = cur;
     if (!s || conn !== s.c || s.closed) return;
-    if (frametype !== 1 && frametype !== 2) return;      // 1 = chiave, 2 = intermedio; 0 = audio
+    if (frametype === 0) {                               // audio G.711 A-law
+      if (audioClients.size && len > 0) {
+        const b = Buffer.from(data.subarray(0, len));
+        for (const c of audioClients) { if (!c.destroyed) c.write(b); }
+      }
+      return;
+    }
+    if (frametype !== 1 && frametype !== 2) return;      // 1 = chiave, 2 = intermedio
     if (!s.gotKey) {
       if (frametype !== 1) return;                       // si parte sempre da un fotogramma chiave
       s.gotKey = true;
@@ -222,3 +288,5 @@ const GOOD_FRAMES = 10;       // da qui in poi la sessione e considerata sana
 
   startSession();
 })();
+
+} // fine modalita video
