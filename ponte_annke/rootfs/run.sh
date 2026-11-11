@@ -6,7 +6,7 @@ OPTS=/data/options.json
 CHANNELS=$(jq -r '.channels' "$OPTS")
 AUDIO=$(jq -r 'if .audio == false then "false" else "true" end' "$OPTS")
 if [ "$AUDIO" != "true" ]; then export PONTE_AUDIO=0; fi
-IP=$(hostname -I 2>/dev/null | tr ' ' '\n' | grep -E '^192\.168\.|^10\.|^172\.(1[6-9]|2[0-9]|3[01])\.' | head -n1)
+IP=$(hostname -I 2>/dev/null | tr ' ' '\n' | grep -E '^192\.168\.|^10\.|^172\.(1[6-9]|2[0-9]|3[01])\.' | head -n1 || true)
 
 # config.json per il ponte (stessa forma usata sul PC)
 jq '{host: .host, port: .port, user: .user, password: .password}' "$OPTS" > /app/config.json

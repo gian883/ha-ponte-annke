@@ -1,5 +1,8 @@
 # Changelog
 
+## 1.0.4
+- Corretto l'avvio della 1.0.3 (errore se non si trova l'indirizzo IP locale).
+
 ## 1.0.3
 - Audio: l'audio G.711 A-law dell'NVR viene inoltrato a go2rtc (sorgente WAV separata, silenzio se manca) e si sente nel player tramite WebRTC (porta 8556). Opzione `audio` per disattivarlo.
 - Nuovo pannello: griglia delle camere, tocco per aprire in HD con pulsanti Chiudi, Precedente/Successiva e Audio.
